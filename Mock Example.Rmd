@@ -1,0 +1,213 @@
+---
+title: "Mock Example"
+author: "Kaiyuan Hua"
+date: "2025-07-29"
+output: html_document
+---
+
+```{r,include=F}
+library(MASS)
+library(nph)
+library(tidyverse)
+library(gsDesign)
+library(survival)
+library(writexl)
+
+source("source_pvalue.R")
+source("source_other.R")
+```
+
+In this mock example, we proposed to illustrate the step-by-step calculation of the group-sequential p-value.
+
+We assume there are three treatment arms (T0, T1, T2). The study endpoint is PFS. We have two hypotheses: H1: T2 vs. T0, and H2: T1 vs. T0.
+
+For simplicity, we assume no treatment arm will be dropped after Stage-1 (at IA1). In Stage-2, we assume 3 interim analyses. Overall, there are 4 interim looks at IA1, IA2, IA3, and FA.
+
+# Basic Set-Ups
+```{r,echo=F}
+t.enroll.end <- 3
+drop.rate <- 0.1
+N <- 200  # sample size per treatment arm
+w <- c(sqrt(1/4), sqrt(3/4))  # weight functions for test statistics
+# alpha-spending
+salpha_PFS <- matrix(NA, nrow = 2, ncol = 3)
+salpha_PFS[1,] <- c(0.005, 0.025*2/3, 0.025) ## PFS: T2 vs. T0
+salpha_PFS[2,] <- c(0.005, 0.025*1/3, 0.025) ## PFS: T1 vs. T0 
+lambda <- log(2)/c(1.0,1.2,1.8)
+W <- c(2/3,1/3)  # initial weight for alpha allocation
+G <- matrix(c(1,0,0,1), nrow = 2, ncol = 2) # transition weight matrix
+```
+
+
+
+# Planned number of events, derived based on H1 from a fixed design
+```{r,echo=F}
+nSurv(lambdaC = log(2)/1,
+      hr = 1/1.8,
+      eta = drop.rate,
+      T = t.enroll.end + 0,
+      minfup = 0,
+      ratio = 1, alpha = .025*2/3, beta = .05, sided = 1)
+nPFS <- 166
+
+# The planned number of events at each interim:
+nevents <- c(ceiling(0.25*nPFS),ceiling(0.5*nPFS), ceiling(0.75*nPFS), nPFS) 
+```
+
+
+# Generate the data. Output: dat
+```{r,echo=F}
+dat <- NULL
+set.seed(12321)
+for (j in 1:3){
+  uj <- runif(N)
+  datj <- data.frame(y = -log(uj)/lambda[j],
+                     trt = j-1)
+  dat <- rbind(dat, datj)
+}
+dat$t.enroll <- runif(3*N, 0, t.enroll.end)
+dat$t.loss <- rexp(3*N, drop.rate)
+
+head(dat)
+```
+
+
+
+# Derive the interim analysis times based on nPFS. Output: t_IAs (time in yrs)
+```{r,echo=F}
+dat_H1 <- dat[dat$trt %in% c(0,2), ]
+t.time <- sort(dat_H1$t.enroll + dat_H1$y)
+n_acum <- NULL
+for (i in nevents[1]:nrow(dat_H1)){
+  dat_H1$t.censor <- pmin(dat_H1$t.loss, t.time[i] - dat_H1$t.enroll)
+  n_acum <- c(n_acum, sum(dat_H1$y <= dat_H1$t.censor))
+}
+t_IAs <- NULL
+for (j in 1:length(nevents)){
+  pos <- min(which(n_acum >= nevents[j]))
+  t_IAs <- c(t_IAs, t.time[nevents[1] + pos - 1])
+}
+t_IAs
+```
+
+
+# Calculate the test statistics X_ij and its variance for each hypothesis and IA
+## Some functions
+```{r,include=F}
+dat.modify <- function(dat, t.IA){
+  dat$t.censor <- pmin(dat$t.loss, t.IA - dat$t.enroll)
+  dat$t <- pmin(dat$y, dat$t.censor)
+  dat$status <- as.numeric(dat$y <= dat$t.censor)
+  return(dat)
+}
+
+
+X.PFS <- function(dat, t_IAs, trt){
+  l <- length(t_IAs)
+  X_PFS <- rep(NA, l)
+  var_PFS <- rep(NA, l-1)
+  dat0 <- dat[dat$trt %in% trt, ]
+  
+  dat1 <- dat0[dat0$t.enroll <= t_IAs[1], ]
+  dat1 <- dat.modify(dat1, t_IAs[1])
+  LR1_PFS <- logrank.test(dat1$t, dat1$status, factor(dat1$trt))
+  X_PFS[1] <- LR1_PFS$test$z
+  
+  for (i in 2:l){
+    dat1 <- dat.modify(dat1, t_IAs[i])
+    LR1_PFS2 <- logrank.test(dat1$t, dat1$status, factor(dat1$trt))
+
+    dat2 <- dat0[dat0$t.enroll <= t_IAs[i] & dat0$t.enroll > t_IAs[1], ]
+    dat2 <- dat.modify(dat2, t_IAs[i])
+    LR2_PFS <-  logrank.test(dat2$t, dat2$status, factor(dat2$trt))
+    
+    var_PFS[i-1] <- LR1_PFS2$var - LR1_PFS$var + LR2_PFS$var
+    X_PFS[i] <- (LR1_PFS2$test$z*sqrt(LR1_PFS2$var) - 
+                   LR1_PFS$test$z*sqrt(LR1_PFS$var) +
+                   LR2_PFS$test$z*sqrt(LR2_PFS$var))/sqrt(var_PFS[i-1])
+  }
+  
+  return(list(X_PFS = X_PFS, var_PFS = var_PFS))
+}
+
+```
+
+
+## Test statistics: X_PFS, Variance: var_PFS
+```{r,echo=F}
+# Calculate the test statistics X_ij and its variance for each hypothesis and IA:
+# The test statistics include all IA's, including Stage-1
+# The variances are only for Stage-2 test statistics, as the variance of test statistics in Stage-1 is 1.
+
+X_PFS <- matrix(NA, 2, length(t_IAs))
+var_PFS <- matrix(NA, 2, length(t_IAs) - 1)
+trt.list <- list(c(0,2), c(0,1))
+## T2 vs. T0
+## T1 vs. T0
+
+for (i in 1:2){
+  X_IAi <- X.PFS(dat, t_IAs, trt = trt.list[[i]])
+  X_PFS[i,] <- X_IAi$X_PFS
+  var_PFS[i,] <- X_IAi$var_PFS
+}
+rownames(X_PFS) <- rownames(var_PFS) <- c("H1","H2")
+colnames(X_PFS) <- c("IA1","IA2","IA3","FA")
+colnames(var_PFS) <- c("IA2","IA3","FA")
+```
+
+
+
+# Steps for calculating group-sequential p-values in Stage-2
+## Step 1: Compute the critical values of g_ij for each hypothesis. Output: g_PFS
+```{r, echo=F}
+# Calculate the correlation matrix for Z_ij
+zcorr_PFS <-list()
+for (i in 1:2){
+  zcorr_PFS[[i]] <- create.m.corr(w, var_PFS[i,])
+}
+# Calculate critical values g_ij
+g_PFS <- matrix(NA, 2, length(t_IAs)-1)
+for (i in 1:2){
+  g_PFS[i,] <- crit.value.g(salpha_PFS[i,], zcorr_PFS[[i]], sided=1)
+}
+rownames(g_PFS) <- c("H1","H2")
+colnames(g_PFS) <- c("IA2","IA3","FA")
+```
+
+
+
+## Step 2: Compute the critical values of c_ij and prepare for the sub-distribution function. Output: c_PFS and xcorr_PFS
+```{r, echo=F}
+# Calculate the critical values c_ij
+c_PFS <- g_PFS - w[1]*matrix(X_PFS[,1], 2, length(t_IAs) - 1)
+rownames(c_PFS) <- c("H1","H2")
+colnames(c_PFS) <- c("IA2","IA3","FA")
+
+# Determine the correlation matrix list for X_ij
+xcorr_PFS <- list()
+for (i in 1:2){
+  xcorr_PFS[[i]] <- create.m.corr(c(0,1), var_PFS[i,])
+}
+```
+
+
+
+## Step 3: Calculate the group-sequential p-values in Stage-2. Output: gsp_PFS
+```{r, echo=F}
+gsp_PFS <- calgsp2(xm = X_PFS[,-1],
+                   critm = c_PFS,
+                   matrix.list = xcorr_PFS,
+                   sided = rep(1,4))$pm
+rownames(gsp_PFS) <- c("H1","H2")
+colnames(gsp_PFS) <- c("IA2","IA3","FA")
+gsp_PFS
+```
+
+
+
+
+
+
+
+
+
