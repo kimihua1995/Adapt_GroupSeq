@@ -2,7 +2,9 @@
 R code for the article "Multiplicity Control in Clinical Trials with Adaptive Selection Followed by Group-Sequential Testing", including:
 
 I) A mock example, `Mock Example.Rmd`, to illustrate the step-by-step calculation of the group-sequential p-value;
+
 II) All codes of the simulation studies.
+
 
 The main code is in `sim.R`, with 5 source function codes:
 
